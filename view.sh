@@ -3,6 +3,7 @@
 # Source this in your .bashrc/.zshrc, or the server's activate script.
 #
 # Usage: view /path/to/image.tiff
+#        view /path/to/file.nwb
 #        view image.png
 #        view .  (lists images in current directory)
 
@@ -22,12 +23,11 @@ view() {
         local dir
         dir="$(cd "$target" && pwd)"
         echo "Images in $dir:"
-        find "$dir" -maxdepth 1 \( -iname '*.tif' -o -iname '*.tiff' -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' -o -iname '*.gif' -o -iname '*.webp' \) -printf '%f\n' 2>/dev/null | sort | while read -r f; do
+        find "$dir" -maxdepth 1 \( -iname '*.tif' -o -iname '*.tiff' -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.nwb' \) -printf '%f\n' 2>/dev/null | sort | while read -r f; do
             local full="$dir/$f"
             local encoded
-            encoded="$(python3 -c "import urllib.parse; print(urllib.parse.quote('$full'))")"
+            encoded="$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$full")"
             local url="http://localhost:${VIEW_PORT}/view?path=${encoded}"
-            # OSC 8 hyperlink (clickable in modern terminals)
             printf '\e]8;;%s\e\\  %s\e]8;;\e\\\n' "$url" "$f"
         done
         return 0
