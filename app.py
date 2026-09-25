@@ -407,12 +407,11 @@ canvas.width = WIDTH;
 canvas.height = HEIGHT;
 
 const FRAME_SIZE = WIDTH * HEIGHT;
-const MAX_CACHE = 200;
-const PREFETCH_AHEAD = 15;
-const PREFETCH_BEHIND = 5;
+const MAX_CACHE = 500;
+const CHUNK_SIZE = 50;
 
 const frameCache = new Map();
-const pendingFetches = new Set();
+const pendingChunks = new Set();
 let currentFrame = 0;
 let playing = false;
 let fps = 30;
@@ -424,6 +423,12 @@ let dataMax = 1;
 let contrastInitialized = false;
 const loadingEl = document.getElementById("loading-indicator");
 
+function bytesPerElement() {
+  if (DTYPE === "uint8") return 1;
+  if (DTYPE === "uint16" || DTYPE === "int16") return 2;
+  return 4;
+}
+
 function createTypedArray(buf) {
   if (DTYPE === "uint8") return new Uint8Array(buf);
   if (DTYPE === "uint16") return new Uint16Array(buf);
@@ -431,46 +436,65 @@ function createTypedArray(buf) {
   return new Float32Array(buf);
 }
 
-function frameUrl(idx) {
-  return `/nwb/frame?path=${encodeURIComponent(NWB_PATH)}&dataset=${encodeURIComponent(DATASET)}&frame=${idx}`;
+function chunkStart(idx) {
+  return Math.floor(idx / CHUNK_SIZE) * CHUNK_SIZE;
 }
 
-async function fetchFrame(idx) {
-  if (idx < 0 || idx >= N_FRAMES) return;
-  if (frameCache.has(idx) || pendingFetches.has(idx)) return;
-  pendingFetches.add(idx);
+function chunkKey(start) {
+  return `${start}-${start + CHUNK_SIZE}`;
+}
+
+async function fetchChunk(start) {
+  const key = chunkKey(start);
+  if (pendingChunks.has(key)) return;
+  const allCached = Array.from({length: Math.min(CHUNK_SIZE, N_FRAMES - start)}, (_, i) => start + i)
+    .every(i => frameCache.has(i));
+  if (allCached) return;
+
+  pendingChunks.add(key);
   loadingEl.style.display = "block";
+  const count = Math.min(CHUNK_SIZE, N_FRAMES - start);
   try {
-    const resp = await fetch(frameUrl(idx));
+    const url = `/nwb/frames?path=${encodeURIComponent(NWB_PATH)}&dataset=${encodeURIComponent(DATASET)}&start=${start}&count=${count}`;
+    const resp = await fetch(url);
     if (!resp.ok) return;
     const buf = await resp.arrayBuffer();
-    frameCache.set(idx, createTypedArray(buf));
-    evictCache(idx);
+    const bpe = bytesPerElement();
+    const frameBytes = FRAME_SIZE * bpe;
+    for (let i = 0; i < count; i++) {
+      const offset = i * frameBytes;
+      const frameBuf = buf.slice(offset, offset + frameBytes);
+      frameCache.set(start + i, createTypedArray(frameBuf));
+    }
+    evictCache(currentFrame);
   } finally {
-    pendingFetches.delete(idx);
-    if (pendingFetches.size === 0) loadingEl.style.display = "none";
+    pendingChunks.delete(key);
+    if (pendingChunks.size === 0) loadingEl.style.display = "none";
   }
+}
+
+async function ensureFrame(idx) {
+  if (frameCache.has(idx)) return;
+  await fetchChunk(chunkStart(idx));
 }
 
 function evictCache(centerIdx) {
-  if (frameCache.size <= MAX_CACHE) return;
-  let furthest = -1, furthestDist = -1;
-  for (const k of frameCache.keys()) {
-    const dist = Math.abs(k - centerIdx);
-    if (dist > furthestDist) { furthestDist = dist; furthest = k; }
+  while (frameCache.size > MAX_CACHE) {
+    let furthest = -1, furthestDist = -1;
+    for (const k of frameCache.keys()) {
+      const dist = Math.abs(k - centerIdx);
+      if (dist > furthestDist) { furthestDist = dist; furthest = k; }
+    }
+    if (furthest >= 0) frameCache.delete(furthest);
+    else break;
   }
-  if (furthest >= 0) frameCache.delete(furthest);
 }
 
 function prefetch(idx) {
-  for (let i = 1; i <= PREFETCH_AHEAD; i++) {
-    const fi = idx + i;
-    if (fi < N_FRAMES) fetchFrame(fi);
-  }
-  for (let i = 1; i <= PREFETCH_BEHIND; i++) {
-    const fi = idx - i;
-    if (fi >= 0) fetchFrame(fi);
-  }
+  const nextChunk = chunkStart(idx) + CHUNK_SIZE;
+  if (nextChunk < N_FRAMES) fetchChunk(nextChunk);
+  const prevChunk = chunkStart(idx) - CHUNK_SIZE;
+  if (prevChunk >= 0) fetchChunk(prevChunk);
 }
 
 function renderFromCache(idx) {
@@ -503,7 +527,7 @@ async function showFrame(idx) {
     ctx.fillStyle = '#e94560';
     ctx.font = '14px monospace';
     ctx.fillText(`Loading frame ${idx}...`, 10, HEIGHT / 2);
-    await fetchFrame(idx);
+    await ensureFrame(idx);
     if (currentFrame === idx) renderFromCache(idx);
   }
 
@@ -1258,6 +1282,58 @@ def nwb_frame():
                 data = ds[frame]
             elif len(ds.shape) == 2:
                 data = ds[()]
+            else:
+                abort(400)
+        else:
+            abort(404)
+
+    data = np.ascontiguousarray(data)
+    if data.dtype not in (np.uint8, np.uint16, np.int16, np.float32):
+        data = data.astype(np.float32)
+
+    buf = io.BytesIO(data.tobytes())
+    buf.seek(0)
+    return send_file(buf, mimetype="application/octet-stream")
+
+
+@app.route("/nwb/frames")
+def nwb_frames():
+    """Serve a batch of frames as a contiguous binary blob."""
+    filepath = request.args.get("path", "")
+    dataset_name = request.args.get("dataset", "")
+    start = request.args.get("start", type=int)
+    count = request.args.get("count", type=int)
+    if not filepath or not dataset_name or start is None or count is None:
+        abort(400)
+    filepath = os.path.abspath(filepath)
+    if not os.path.isfile(filepath):
+        abort(404)
+
+    count = min(count, 200)
+    base_name = dataset_name.split("/")[0]
+
+    with h5py.File(filepath, "r") as f:
+        grp = f[f"acquisition/{base_name}"]
+        is_pmd = "pmd" in grp
+
+        if is_pmd and "/" in dataset_name:
+            ds = f[f"acquisition/{dataset_name}"]
+            data = ds[()][np.newaxis, ...]
+        elif is_pmd:
+            pmd = _get_pmd_array(filepath, base_name)
+            if pmd is None:
+                abort(404)
+            end = min(start + count, pmd.shape[0])
+            data = pmd[start:end]
+            if data.ndim == 2:
+                data = data[np.newaxis, ...]
+        elif "data" in grp:
+            ds = grp["data"]
+            if len(ds.shape) == 3:
+                end = min(start + count, ds.shape[0])
+                data = ds[start:end]
+            elif len(ds.shape) == 2:
+                data = ds[()][np.newaxis, ...]
             else:
                 abort(400)
         else:
